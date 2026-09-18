@@ -418,13 +418,22 @@ def test_identity_is_empty_for_unusable_tokens(token):
 # ── Callback route ────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_callback_provider_error_returns_generic_error():
+async def test_callback_provider_error_surfaces_code_and_aadsts():
+    """Microsoft's refusal must reach the operator: the OAuth2 code says what
+    was refused, the AADSTS number says why. Both are fixed-vocabulary tokens."""
     resp = await _callback_endpoint()(
-        code=None, state=None, error="access_denied", request=_FakeRequest()
+        code=None, state=None, error="access_denied",
+        error_description="AADSTS65001: The user or administrator has not consented.",
+        request=_FakeRequest(),
     )
     location = _location(resp)
     assert "email_oauth_error=microsoft_error" in location
-    assert "access_denied" not in location
+    assert "email_oauth_provider=microsoft" in location
+    assert "email_oauth_code=access_denied" in location
+    assert "email_oauth_aadsts=AADSTS65001" in location
+    # The provider's prose never rides along — only the two codes.
+    assert "consented" not in location
+    assert "administrator" not in location
 
 
 @pytest.mark.asyncio
@@ -489,7 +498,7 @@ async def test_callback_without_refresh_token_is_refused():
             error=None, request=_FakeRequest(),
         )
 
-    assert "email_oauth_error=token_exchange_failed" in _location(resp)
+    assert "email_oauth_error=missing_refresh_token" in _location(resp)
 
     verify_db = Factory()
     row = verify_db.query(EmailAccount).filter(EmailAccount.id == "acct-nr").first()
@@ -885,3 +894,78 @@ def test_smtp_send_uses_xoauth2_for_microsoft_accounts():
         "user=alice@contoso.com\x01auth=Bearer ms-token\x01\x01"
     )
     smtp.sendmail.assert_called_once()
+
+
+# ── Diagnostics are surfaced, but only in bounded shapes ──────────
+#
+# The callback is an unauthenticated endpoint: anyone can craft a request to it
+# with any `error` / `error_description`. Those strings reach a server log line
+# and the browser's URL, so the sanitizer is the only thing standing between a
+# crafted callback and log injection or a forged message in the UI.
+
+@pytest.mark.parametrize("hostile", [
+    "<script>alert(1)</script>",
+    "access denied",                       # space is not in the vocabulary
+    "Access_Denied",                       # uppercase is not either
+    "error\nWARNING: fake log line",       # log injection via newline
+    "error\r\nSet-Cookie: a=b",            # header/response splitting shape
+    "user@example.com",                    # a mailbox address must never ride along
+    "a" * 41,                              # longer than the bounded length
+    "../../etc/passwd",
+    "&email_oauth_error=forged",           # parameter smuggling
+])
+def test_hostile_error_codes_are_dropped_entirely(hostile):
+    from routes.email_routes import _oauth_failure_hints
+
+    code, aadsts = _oauth_failure_hints(hostile, None)
+    assert code == "", f"{hostile!r} must not pass the allow-list"
+    assert aadsts == ""
+
+
+@pytest.mark.parametrize("code", [
+    "access_denied", "consent_required", "invalid_scope",
+    "interaction_required", "invalid_client", "a", "a" * 40,
+])
+def test_real_oauth_error_codes_pass_through(code):
+    from routes.email_routes import _oauth_failure_hints
+
+    assert _oauth_failure_hints(code, None)[0] == code
+
+
+@pytest.mark.parametrize("description,expected", [
+    ("AADSTS65001: The user or administrator has not consented", "AADSTS65001"),
+    ("Something AADSTS7000215 something", "AADSTS7000215"),
+    ("no code here at all", ""),
+    ("AADSTS12: too short to be a real code", ""),
+    ("AADSTS123456789: too long", "AADSTS1234567"),
+])
+def test_aadsts_number_is_extracted_from_free_text(description, expected):
+    """Only the AADSTS token is lifted out; the surrounding prose is discarded."""
+    from routes.email_routes import _oauth_failure_hints
+
+    assert _oauth_failure_hints(None, description)[1] == expected
+
+
+def test_hostile_description_cannot_smuggle_text_alongside_an_aadsts_code():
+    from routes.email_routes import _oauth_failure_hints
+
+    code, aadsts = _oauth_failure_hints(
+        None, "AADSTS65001 <img src=x onerror=alert(1)> user@example.com"
+    )
+    assert code == ""
+    assert aadsts == "AADSTS65001", "only the bounded token survives"
+
+
+def test_redirect_carries_no_unsanitized_provider_text():
+    """End to end: a hostile callback produces a redirect with nothing in it
+    beyond Odysseus's own codes."""
+    from routes.email_routes import _oauth_failure_hints, _oauth_result_redirect
+
+    code, aadsts = _oauth_failure_hints(
+        "<script>x</script>", "totally free text with user@example.com"
+    )
+    location = _oauth_result_redirect("microsoft_error", "microsoft", code, aadsts)
+
+    assert location == "/?section=integrations&email_oauth_error=microsoft_error&email_oauth_provider=microsoft"
+    assert "script" not in location
+    assert "@" not in location

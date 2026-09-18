@@ -93,6 +93,25 @@ end up paired with another identity's credentials.
 
 ## Troubleshooting
 
+When a connect fails, Odysseus shows a panel naming the provider's own error
+code (and Microsoft's `AADSTS` number when there is one), with a **Copy code**
+button. The same codes are written to the server log, so
+`docker compose logs odysseus | grep OAuth` finds them after the fact:
+
+```
+Microsoft OAuth authorization was refused (code=access_denied aadsts=AADSTS65001)
+```
+
+Common codes:
+
+| Code | Meaning |
+|---|---|
+| `AADSTS65001` | Nobody has consented to the app for the tenant. Use **Grant admin consent** under API permissions. |
+| `AADSTS90094` | The app needs administrator approval — ask a tenant admin. |
+| `AADSTS7000215` | Wrong client secret. Copy the secret's **Value**, not its Secret ID. |
+| `AADSTS700016` | The app was not found in the tenant — check the client and tenant ids. |
+| `AADSTS50011` | The redirect URI does not match the registered one, exactly. |
+
 **`AUTHENTICATE failed` right after connecting.** The Exchange delegated
 permissions are usually missing, or IMAP/SMTP AUTH is disabled for the mailbox.
 An administrator can enable it per mailbox with

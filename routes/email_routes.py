@@ -131,6 +131,47 @@ _OAUTH_MAIL_TRANSPORT = {
 }
 
 
+# An OAuth callback is an unauthenticated endpoint: anything in its query
+# string, and anything a token endpoint puts in an error body, is untrusted
+# free text. Only these two fixed shapes are ever allowed out of it — into a
+# log line or back into the browser's URL — so a crafted callback cannot inject
+# markup, forge a message, or smuggle newlines into the logs.
+_OAUTH_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+_AADSTS_CODE_RE = re.compile(r"AADSTS\d{4,7}")
+
+
+def _oauth_failure_hints(error, description) -> tuple[str, str]:
+    """Return (oauth_error_code, aadsts_code) — bounded tokens, or empty.
+
+    The OAuth2 code (`access_denied`, `consent_required`, …) says what the
+    provider refused; Microsoft's AADSTS number says exactly why, and is the
+    one thing that turns "it failed" into an actionable fix. Everything else
+    in the provider's message is dropped.
+    """
+    raw_error = str(error or "").strip()
+    code = raw_error if _OAUTH_ERROR_CODE_RE.match(raw_error) else ""
+    found = _AADSTS_CODE_RE.search(f"{description or ''} {raw_error}")
+    return code, (found.group(0) if found else "")
+
+
+def _oauth_result_redirect(reason: str, provider: str = "", code: str = "", aadsts: str = "") -> str:
+    """Build the settings redirect for an OAuth outcome.
+
+    `reason` is Odysseus's own error code; `code`/`aadsts` are the sanitized
+    provider hints, surfaced so the operator can act on the failure without
+    digging the callback URL out of browser history.
+    """
+    import urllib.parse
+    params = {"section": "integrations", "email_oauth_error": reason}
+    if provider:
+        params["email_oauth_provider"] = provider
+    if code:
+        params["email_oauth_code"] = code
+    if aadsts:
+        params["email_oauth_aadsts"] = aadsts
+    return "/?" + urllib.parse.urlencode(params)
+
+
 def _microsoft_identity_from_id_token(id_token: str) -> tuple[str, str]:
     """Return (email, display_name) from an OIDC id_token's claims.
 
@@ -6199,12 +6240,16 @@ def setup_email_routes():
         import urllib.parse
         from fastapi.responses import RedirectResponse as _RR
         if error:
-            return _RR("/?section=integrations&email_oauth_error=google_error")
+            hint_code, _ = _oauth_failure_hints(error, None)
+            logger.warning(
+                "Google OAuth authorization was refused (code=%s)", hint_code or "unknown"
+            )
+            return _RR(_oauth_result_redirect("google_error", "google", hint_code))
         if not code or not state:
-            return _RR("/?section=integrations&email_oauth_error=missing_code")
+            return _RR(_oauth_result_redirect("missing_code", "google"))
         state_data = verify_oauth_state(state)
         if not state_data:
-            return _RR("/?section=integrations&email_oauth_error=invalid_state")
+            return _RR(_oauth_result_redirect("invalid_state", "google"))
         account_id = state_data.get("a", "")
         owner = state_data.get("o", "")
         client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
@@ -6226,12 +6271,12 @@ def setup_email_routes():
             data = resp.json()
         except Exception:
             logger.warning("Google token exchange failed")
-            return _RR("/?section=integrations&email_oauth_error=token_exchange_failed")
+            return _RR(_oauth_result_redirect("token_exchange_failed", "google"))
         access_token = data.get("access_token", "")
         refresh_token = data.get("refresh_token", "")
         if not access_token or not refresh_token:
             logger.warning("Google token exchange omitted required offline credentials")
-            return _RR("/?section=integrations&email_oauth_error=token_exchange_failed")
+            return _RR(_oauth_result_redirect("missing_refresh_token", "google"))
         expiry = str(int(time.time()) + data.get("expires_in", 3600))
         # Fetch the email address from userinfo so we can auto-fill imap_user.
         email_addr = ""
@@ -6264,8 +6309,8 @@ def setup_email_routes():
             },
         )
         if error_code:
-            return _RR(f"/?section=integrations&email_oauth_error={error_code}")
-        return _RR("/?section=integrations&email_oauth_success=1")
+            return _RR(_oauth_result_redirect(error_code, "google"))
+        return _RR("/?section=integrations&email_oauth_success=1&email_oauth_provider=google")
 
     # ── Microsoft (Outlook / Office 365) OAuth2 routes ──
 
@@ -6299,16 +6344,25 @@ def setup_email_routes():
         code: str = Query(None),
         state: str = Query(None),
         error: str = Query(None),
+        error_description: str = Query(None),
         request: Request = None,
     ):
         from fastapi.responses import RedirectResponse as _RR
         if error:
-            return _RR("/?section=integrations&email_oauth_error=microsoft_error")
+            # Microsoft refused before issuing a code. Its AADSTS number is the
+            # difference between "OAuth failed" and a fix, so log it and hand
+            # it to the UI rather than dropping it on the floor.
+            hint_code, aadsts = _oauth_failure_hints(error, error_description)
+            logger.warning(
+                "Microsoft OAuth authorization was refused (code=%s aadsts=%s)",
+                hint_code or "unknown", aadsts or "none",
+            )
+            return _RR(_oauth_result_redirect("microsoft_error", "microsoft", hint_code, aadsts))
         if not code or not state:
-            return _RR("/?section=integrations&email_oauth_error=missing_code")
+            return _RR(_oauth_result_redirect("missing_code", "microsoft"))
         state_data = verify_oauth_state(state)
         if not state_data:
-            return _RR("/?section=integrations&email_oauth_error=invalid_state")
+            return _RR(_oauth_result_redirect("invalid_state", "microsoft"))
         account_id = state_data.get("a", "")
         owner = state_data.get("o", "")
         client_id = os.environ.get("MICROSOFT_OAUTH_CLIENT_ID", "")
@@ -6318,6 +6372,7 @@ def setup_email_routes():
             or f"{request.url.scheme}://{request.headers.get('host', 'localhost:7000')}/api/email/oauth/microsoft/callback"
         )
         import httpx as _httpx
+        resp = None
         try:
             resp = _httpx.post(microsoft_oauth_token_url(), data={
                 "code": code,
@@ -6330,8 +6385,23 @@ def setup_email_routes():
             resp.raise_for_status()
             data = resp.json()
         except Exception:
-            logger.warning("Microsoft token exchange failed")
-            return _RR("/?section=integrations&email_oauth_error=token_exchange_failed")
+            # A rejected exchange (expired secret, wrong redirect URI) answers
+            # with an AADSTS code in the body; raise_for_status hides it, so
+            # read it back off the response before reporting the failure.
+            body_error, body_description = "", ""
+            if resp is not None:
+                try:
+                    payload = resp.json()
+                    body_error = payload.get("error") or ""
+                    body_description = payload.get("error_description") or ""
+                except Exception:
+                    pass
+            hint_code, aadsts = _oauth_failure_hints(body_error, body_description)
+            logger.warning(
+                "Microsoft token exchange failed (code=%s aadsts=%s)",
+                hint_code or "unknown", aadsts or "none",
+            )
+            return _RR(_oauth_result_redirect("token_exchange_failed", "microsoft", hint_code, aadsts))
         access_token = data.get("access_token", "")
         refresh_token = data.get("refresh_token", "")
         if not access_token or not refresh_token:
@@ -6339,7 +6409,7 @@ def setup_email_routes():
             # mailbox would stop working an hour later. Refuse the connect
             # rather than store credentials that expire.
             logger.warning("Microsoft token exchange omitted required offline credentials")
-            return _RR("/?section=integrations&email_oauth_error=token_exchange_failed")
+            return _RR(_oauth_result_redirect("missing_refresh_token", "microsoft"))
         expiry = str(int(time.time()) + data.get("expires_in", 3600))
         # The mailbox address comes from the id_token's claims — Microsoft has
         # no userinfo endpoint on the mail resource, and asking Graph for /me
@@ -6364,7 +6434,7 @@ def setup_email_routes():
             },
         )
         if error_code:
-            return _RR(f"/?section=integrations&email_oauth_error={error_code}")
-        return _RR("/?section=integrations&email_oauth_success=1")
+            return _RR(_oauth_result_redirect(error_code, "microsoft"))
+        return _RR("/?section=integrations&email_oauth_success=1&email_oauth_provider=microsoft")
 
     return router
