@@ -50,7 +50,9 @@ from routes.email_helpers import (
     _load_settings, _save_settings, _get_email_config,
     _send_smtp_message, _smtp_security_mode,
     _IMAP_TIMEOUT_SECONDS, _open_imap_connection,
-    _get_valid_google_token, _xoauth2_bytes, _xoauth2_raw,
+    _get_valid_google_token, _get_valid_oauth_token, _xoauth2_bytes, _xoauth2_raw,
+    oauth_provider_label, microsoft_oauth_authorize_url, microsoft_oauth_token_url,
+    _MICROSOFT_OAUTH_SCOPES,
     make_oauth_state, verify_oauth_state,
     EmailNotConfiguredError,
     _imap_connect, _imap, _decode_header, _detect_sent_folder, _detect_drafts_folder,
@@ -72,6 +74,8 @@ ODYSSEUS_MAIL_ORIGIN = "odysseus-ui"
 EMAIL_READ_ATTACHMENT_VERSION = 2
 _GOOGLE_OAUTH_IMAP_HOST = "imap.gmail.com"
 _GOOGLE_OAUTH_SMTP_HOST = "smtp.gmail.com"
+_MICROSOFT_OAUTH_IMAP_HOST = "outlook.office365.com"
+_MICROSOFT_OAUTH_SMTP_HOST = "smtp.office365.com"
 _SERVER_OWNED_OAUTH_FIELDS = {
     "oauth_provider",
     "oauth_access_token",
@@ -91,6 +95,154 @@ def _google_oauth_imap_transport_allowed(port: int, starttls: bool) -> bool:
 
 def _google_oauth_smtp_transport_allowed(port: int, security: str) -> bool:
     return (port == 465 and security == "ssl") or (port == 587 and security == "starttls")
+
+
+def _microsoft_oauth_imap_transport_allowed(port: int, starttls: bool) -> bool:
+    return (port == 993 and not starttls) or (port == 143 and starttls)
+
+
+def _microsoft_oauth_smtp_transport_allowed(port: int, security: str) -> bool:
+    # Microsoft 365 publishes STARTTLS on 587 only — there is no implicit-TLS
+    # SMTP endpoint on smtp.office365.com to allow here.
+    return port == 587 and security == "starttls"
+
+
+# An OAuth account's token only authorizes that provider's mail servers, so
+# each provider is pinned to its own hosts and TLS transports. Without this an
+# edited host could point a valid access token at an attacker-controlled
+# server, which would happily collect the bearer token from the XOAUTH2 frame.
+_OAUTH_MAIL_TRANSPORT = {
+    "google": {
+        "imap_host": _GOOGLE_OAUTH_IMAP_HOST,
+        "smtp_host": _GOOGLE_OAUTH_SMTP_HOST,
+        "imap_allowed": _google_oauth_imap_transport_allowed,
+        "smtp_allowed": _google_oauth_smtp_transport_allowed,
+        "imap_transport_hint": "TLS on port 993 or STARTTLS on port 143",
+        "smtp_transport_hint": "TLS on port 465 or STARTTLS on port 587",
+    },
+    "microsoft": {
+        "imap_host": _MICROSOFT_OAUTH_IMAP_HOST,
+        "smtp_host": _MICROSOFT_OAUTH_SMTP_HOST,
+        "imap_allowed": _microsoft_oauth_imap_transport_allowed,
+        "smtp_allowed": _microsoft_oauth_smtp_transport_allowed,
+        "imap_transport_hint": "TLS on port 993 or STARTTLS on port 143",
+        "smtp_transport_hint": "STARTTLS on port 587",
+    },
+}
+
+
+def _microsoft_identity_from_id_token(id_token: str) -> tuple[str, str]:
+    """Return (email, display_name) from an OIDC id_token's claims.
+
+    The token is read straight out of the token-endpoint response, over TLS,
+    from an issuer we dialed ourselves — so its claims are used only to
+    auto-fill the mailbox fields and to feed the identity check that follows.
+    They never stand in for an authorization decision, which is why the
+    signature is not re-validated here.
+    """
+    import base64 as _b64
+    try:
+        payload_b64 = id_token.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        claims = json.loads(_b64.urlsafe_b64decode(payload_b64).decode())
+    except Exception:
+        return "", ""
+    if not isinstance(claims, dict):
+        return "", ""
+    email_addr = ""
+    # `email` is present when the mailbox is verified; work/school tenants that
+    # omit it still carry the sign-in name in `preferred_username` / `upn`.
+    for key in ("email", "preferred_username", "upn"):
+        value = claims.get(key)
+        if isinstance(value, str) and "@" in value:
+            email_addr = value.strip()
+            break
+    name = claims.get("name")
+    return email_addr, name.strip() if isinstance(name, str) else ""
+
+
+def _persist_oauth_account_tokens(
+    provider: str,
+    account_id: str,
+    owner: str,
+    access_token: str,
+    refresh_token: str,
+    expiry: str,
+    email_addr: str,
+    display_name: str,
+    defaults: dict,
+) -> str | None:
+    """Store verified OAuth credentials on an account row.
+
+    Shared by every provider callback so the ownership and mailbox-identity
+    guards can't drift apart between them. Returns an error code for the
+    redirect, or None once the tokens are committed.
+    """
+    from core.database import SessionLocal, EmailAccount
+    from src.secret_storage import encrypt as _enc
+    db = SessionLocal()
+    try:
+        row = db.query(EmailAccount).filter(EmailAccount.id == account_id).first()
+        if not row:
+            return "account_not_found"
+        # SECURITY: verify the account belongs to the initiating user.
+        if owner and row.owner and row.owner != owner:
+            logger.warning("OAuth callback owner mismatch — rejecting token write")
+            return "ownership_error"
+
+        # A reconnect must prove that the token belongs to the mailbox already
+        # configured on this row. Otherwise authenticating a different account
+        # leaves the saved IMAP/SMTP usernames paired with credentials for
+        # another identity.
+        verified_email = (
+            email_addr.strip().casefold()
+            if isinstance(email_addr, str)
+            else ""
+        )
+        configured_logins = {
+            value.strip().casefold()
+            for value in (row.imap_user or "", row.smtp_user or "")
+            if value.strip()
+        }
+        if not verified_email or any(
+            login != verified_email for login in configured_logins
+        ):
+            logger.warning(
+                "%s OAuth mailbox identity verification failed for account %s",
+                oauth_provider_label(provider),
+                account_id,
+            )
+            return "identity_verification_failed"
+
+        row.oauth_provider = provider
+        row.oauth_access_token = _enc(access_token)
+        row.oauth_refresh_token = _enc(refresh_token)
+        row.oauth_token_expiry = expiry
+        # Auto-fill the provider's IMAP/SMTP settings if not already configured.
+        if not row.imap_host:
+            row.imap_host = defaults["imap_host"]
+            row.imap_port = defaults["imap_port"]
+            row.imap_starttls = defaults["imap_starttls"]
+        if not row.smtp_host:
+            row.smtp_host = defaults["smtp_host"]
+            row.smtp_port = defaults["smtp_port"]
+            row.smtp_security = defaults["smtp_security"]
+        if email_addr:
+            if not row.imap_user:
+                row.imap_user = email_addr
+            if not row.smtp_user:
+                row.smtp_user = email_addr
+            if not row.from_address:
+                row.from_address = email_addr
+            if not row.name or row.name == row.id:
+                row.name = email_addr
+        if display_name and not row.display_name:
+            row.display_name = display_name
+        db.commit()
+        return None
+    finally:
+        db.close()
+
 
 def _email_style_key(account_id: str | None) -> str:
     return str(account_id or "").strip()
@@ -5850,31 +6002,38 @@ def setup_email_routes():
         imap_starttls = bool(body.get("imap_starttls"))
         oauth_provider = body.get("oauth_provider") or ""
 
-        google_token = None
-        google_token_loaded = False
-        google_ssl_context = (
+        # Transport pinning for the provider this account is connected to;
+        # None for password accounts, which keep their free-form host/port.
+        oauth_rules = _OAUTH_MAIL_TRANSPORT.get(oauth_provider)
+        oauth_label = oauth_provider_label(oauth_provider)
+
+        oauth_token = None
+        oauth_token_loaded = False
+        oauth_ssl_context = (
             ssl.create_default_context()
-            if oauth_provider == "google"
+            if oauth_provider
             else None
         )
 
-        def _google_token():
-            nonlocal google_token, google_token_loaded
-            if not google_token_loaded:
-                google_token = _get_valid_google_token(body.get("account_id"), body)
-                google_token_loaded = True
-            if not google_token:
-                raise RuntimeError("Google OAuth token unavailable — reconnect the account")
-            return google_token
+        def _oauth_token():
+            nonlocal oauth_token, oauth_token_loaded
+            if not oauth_token_loaded:
+                oauth_token = _get_valid_oauth_token(body.get("account_id"), body)
+                oauth_token_loaded = True
+            if not oauth_token:
+                raise RuntimeError(f"{oauth_label} OAuth token unavailable — reconnect the account")
+            return oauth_token
 
         if imap_port_err:
             imap_result = {"ok": False, "error": imap_port_err}
-        elif not (imap_host and imap_user and (imap_pass or oauth_provider == "google")):
+        elif oauth_provider and not oauth_rules:
+            imap_result = {"ok": False, "error": f"Unsupported OAuth provider {oauth_provider!r} — reconnect the account"}
+        elif not (imap_host and imap_user and (imap_pass or oauth_provider)):
             imap_result = {"ok": False, "error": "Need IMAP host, username, and password"}
-        elif oauth_provider == "google" and _normalized_mail_host(imap_host) != _GOOGLE_OAUTH_IMAP_HOST:
-            imap_result = {"ok": False, "error": "Google OAuth IMAP requires imap.gmail.com"}
-        elif oauth_provider == "google" and not _google_oauth_imap_transport_allowed(imap_port, imap_starttls):
-            imap_result = {"ok": False, "error": "Google OAuth IMAP requires TLS on port 993 or STARTTLS on port 143"}
+        elif oauth_rules and _normalized_mail_host(imap_host) != oauth_rules["imap_host"]:
+            imap_result = {"ok": False, "error": f"{oauth_label} OAuth IMAP requires {oauth_rules['imap_host']}"}
+        elif oauth_rules and not oauth_rules["imap_allowed"](imap_port, imap_starttls):
+            imap_result = {"ok": False, "error": f"{oauth_label} OAuth IMAP requires {oauth_rules['imap_transport_hint']}"}
         else:
             # Connection mode resolution:
             #   STARTTLS on  → plain IMAP4 + .starttls() (upgrade)
@@ -5888,16 +6047,16 @@ def setup_email_routes():
                     "starttls": imap_starttls,
                     "timeout": _IMAP_TIMEOUT_SECONDS,
                 }
-                if google_ssl_context:
-                    imap_kwargs["ssl_context"] = google_ssl_context
+                if oauth_ssl_context:
+                    imap_kwargs["ssl_context"] = oauth_ssl_context
                 conn = _open_imap_connection(
                     imap_host,
                     imap_port,
                     **imap_kwargs,
                 )
                 try:
-                    if oauth_provider == "google":
-                        token = _google_token()
+                    if oauth_provider:
+                        token = _oauth_token()
                         conn.authenticate("XOAUTH2", lambda x: _xoauth2_bytes(imap_user, token))
                     else:
                         conn.login(imap_user, imap_pass)
@@ -5912,17 +6071,17 @@ def setup_email_routes():
         smtp_port, smtp_port_err = _coerce_port(body.get("smtp_port"), 465)
         if smtp_host and smtp_port_err:
             smtp_result = {"ok": False, "error": smtp_port_err}
-        elif oauth_provider == "google" and smtp_host and _normalized_mail_host(smtp_host) != _GOOGLE_OAUTH_SMTP_HOST:
-            smtp_result = {"ok": False, "error": "Google OAuth SMTP requires smtp.gmail.com"}
+        elif oauth_rules and smtp_host and _normalized_mail_host(smtp_host) != oauth_rules["smtp_host"]:
+            smtp_result = {"ok": False, "error": f"{oauth_label} OAuth SMTP requires {oauth_rules['smtp_host']}"}
         elif (
-            oauth_provider == "google"
+            oauth_rules
             and smtp_host
-            and not _google_oauth_smtp_transport_allowed(
+            and not oauth_rules["smtp_allowed"](
                 smtp_port,
                 _smtp_security_mode({"smtp_security": body.get("smtp_security"), "smtp_port": smtp_port}),
             )
         ):
-            smtp_result = {"ok": False, "error": "Google OAuth SMTP requires TLS on port 465 or STARTTLS on port 587"}
+            smtp_result = {"ok": False, "error": f"{oauth_label} OAuth SMTP requires {oauth_rules['smtp_transport_hint']}"}
         elif smtp_host:
             smtp_security = _smtp_security_mode({"smtp_security": body.get("smtp_security"), "smtp_port": smtp_port})
             smtp_user = (body.get("smtp_user") or imap_user).strip()
@@ -5931,8 +6090,8 @@ def setup_email_routes():
             try:
                 if smtp_security == "ssl":
                     smtp_kwargs = (
-                        {"context": google_ssl_context}
-                        if google_ssl_context
+                        {"context": oauth_ssl_context}
+                        if oauth_ssl_context
                         else {}
                     )
                     smtp = smtplib.SMTP_SSL(
@@ -5945,8 +6104,8 @@ def setup_email_routes():
                     smtp = smtplib.SMTP(smtp_host, smtp_port, timeout=10)
                     if smtp_security == "starttls":
                         try:
-                            if google_ssl_context:
-                                smtp.starttls(context=google_ssl_context)
+                            if oauth_ssl_context:
+                                smtp.starttls(context=oauth_ssl_context)
                             else:
                                 smtp.starttls()
                         except Exception:
@@ -5958,8 +6117,8 @@ def setup_email_routes():
                                 pass
                             smtp = None
                             raise
-                if oauth_provider == "google":
-                    token = _google_token()
+                if oauth_provider:
+                    token = _oauth_token()
                     smtp.ehlo()
                     smtp.auth("XOAUTH2", lambda challenge=None: _xoauth2_raw(smtp_user, token), initial_response_ok=True)
                 else:
@@ -6086,67 +6245,126 @@ def setup_email_routes():
                 display_name = ui_data.get("name", "")
         except Exception:
             pass
-        from core.database import SessionLocal, EmailAccount
-        from src.secret_storage import encrypt as _enc
-        db = SessionLocal()
+        error_code = _persist_oauth_account_tokens(
+            provider="google",
+            account_id=account_id,
+            owner=owner,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expiry=expiry,
+            email_addr=email_addr,
+            display_name=display_name,
+            defaults={
+                "imap_host": _GOOGLE_OAUTH_IMAP_HOST,
+                "imap_port": 993,
+                "imap_starttls": False,
+                "smtp_host": _GOOGLE_OAUTH_SMTP_HOST,
+                "smtp_port": 587,
+                "smtp_security": "starttls",
+            },
+        )
+        if error_code:
+            return _RR(f"/?section=integrations&email_oauth_error={error_code}")
+        return _RR("/?section=integrations&email_oauth_success=1")
+
+    # ── Microsoft (Outlook / Office 365) OAuth2 routes ──
+
+    @router.get("/oauth/microsoft/authorize")
+    async def microsoft_oauth_authorize(account_id: str = Query(...), request: Request = None, owner: str = Depends(require_user)):
+        import urllib.parse
+        _assert_owns_account(account_id, owner)
+        client_id = os.environ.get("MICROSOFT_OAUTH_CLIENT_ID", "")
+        if not client_id:
+            raise HTTPException(400, "MICROSOFT_OAUTH_CLIENT_ID not set — add it to .env")
+        redirect_uri = (
+            os.environ.get("MICROSOFT_OAUTH_REDIRECT_URI")
+            or f"{request.url.scheme}://{request.headers.get('host', 'localhost:7000')}/api/email/oauth/microsoft/callback"
+        )
+        state = make_oauth_state(account_id, owner)
+        params = urllib.parse.urlencode({
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": _MICROSOFT_OAUTH_SCOPES,
+            # Re-prompt so a reconnect can target a different mailbox than the
+            # one the browser is currently signed into.
+            "prompt": "select_account",
+            "state": state,
+        })
+        from fastapi.responses import RedirectResponse as _RR
+        return _RR(f"{microsoft_oauth_authorize_url()}?{params}")
+
+    @router.get("/oauth/microsoft/callback")
+    async def microsoft_oauth_callback(
+        code: str = Query(None),
+        state: str = Query(None),
+        error: str = Query(None),
+        request: Request = None,
+    ):
+        from fastapi.responses import RedirectResponse as _RR
+        if error:
+            return _RR("/?section=integrations&email_oauth_error=microsoft_error")
+        if not code or not state:
+            return _RR("/?section=integrations&email_oauth_error=missing_code")
+        state_data = verify_oauth_state(state)
+        if not state_data:
+            return _RR("/?section=integrations&email_oauth_error=invalid_state")
+        account_id = state_data.get("a", "")
+        owner = state_data.get("o", "")
+        client_id = os.environ.get("MICROSOFT_OAUTH_CLIENT_ID", "")
+        client_secret = os.environ.get("MICROSOFT_OAUTH_CLIENT_SECRET", "")
+        redirect_uri = (
+            os.environ.get("MICROSOFT_OAUTH_REDIRECT_URI")
+            or f"{request.url.scheme}://{request.headers.get('host', 'localhost:7000')}/api/email/oauth/microsoft/callback"
+        )
+        import httpx as _httpx
         try:
-            row = db.query(EmailAccount).filter(EmailAccount.id == account_id).first()
-            if not row:
-                return _RR("/?section=integrations&email_oauth_error=account_not_found")
-            # SECURITY: verify the account belongs to the initiating user.
-            if owner and row.owner and row.owner != owner:
-                logger.warning("OAuth callback owner mismatch — rejecting token write")
-                return _RR("/?section=integrations&email_oauth_error=ownership_error")
-
-            # A reconnect must prove that the token belongs to the mailbox
-            # already configured on this row. Otherwise authenticating a
-            # different Google account leaves the saved IMAP/SMTP usernames
-            # paired with credentials for another identity.
-            verified_email = (
-                email_addr.strip().casefold()
-                if isinstance(email_addr, str)
-                else ""
-            )
-            configured_logins = {
-                value.strip().casefold()
-                for value in (row.imap_user or "", row.smtp_user or "")
-                if value.strip()
-            }
-            if not verified_email or any(
-                login != verified_email for login in configured_logins
-            ):
-                logger.warning(
-                    "Google OAuth mailbox identity verification failed for account %s",
-                    account_id,
-                )
-                return _RR("/?section=integrations&email_oauth_error=identity_verification_failed")
-
-            row.oauth_provider = "google"
-            row.oauth_access_token = _enc(access_token)
-            row.oauth_refresh_token = _enc(refresh_token)
-            row.oauth_token_expiry = expiry
-            # Auto-fill Google IMAP/SMTP settings if not already configured.
-            if not row.imap_host:
-                row.imap_host = "imap.gmail.com"
-                row.imap_port = 993
-                row.imap_starttls = False
-            if not row.smtp_host:
-                row.smtp_host = "smtp.gmail.com"
-                row.smtp_port = 587
-            if email_addr:
-                if not row.imap_user:
-                    row.imap_user = email_addr
-                if not row.smtp_user:
-                    row.smtp_user = email_addr
-                if not row.from_address:
-                    row.from_address = email_addr
-                if not row.name or row.name == row.id:
-                    row.name = email_addr
-            if display_name and not row.display_name:
-                row.display_name = display_name
-            db.commit()
-        finally:
-            db.close()
+            resp = _httpx.post(microsoft_oauth_token_url(), data={
+                "code": code,
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code",
+                "scope": _MICROSOFT_OAUTH_SCOPES,
+            }, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            logger.warning("Microsoft token exchange failed")
+            return _RR("/?section=integrations&email_oauth_error=token_exchange_failed")
+        access_token = data.get("access_token", "")
+        refresh_token = data.get("refresh_token", "")
+        if not access_token or not refresh_token:
+            # No refresh token means `offline_access` was not granted, so the
+            # mailbox would stop working an hour later. Refuse the connect
+            # rather than store credentials that expire.
+            logger.warning("Microsoft token exchange omitted required offline credentials")
+            return _RR("/?section=integrations&email_oauth_error=token_exchange_failed")
+        expiry = str(int(time.time()) + data.get("expires_in", 3600))
+        # The mailbox address comes from the id_token's claims — Microsoft has
+        # no userinfo endpoint on the mail resource, and asking Graph for /me
+        # would need a second consent for a different resource.
+        email_addr, display_name = _microsoft_identity_from_id_token(data.get("id_token", "") or "")
+        error_code = _persist_oauth_account_tokens(
+            provider="microsoft",
+            account_id=account_id,
+            owner=owner,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expiry=expiry,
+            email_addr=email_addr,
+            display_name=display_name,
+            defaults={
+                "imap_host": _MICROSOFT_OAUTH_IMAP_HOST,
+                "imap_port": 993,
+                "imap_starttls": False,
+                "smtp_host": _MICROSOFT_OAUTH_SMTP_HOST,
+                "smtp_port": 587,
+                "smtp_security": "starttls",
+            },
+        )
+        if error_code:
+            return _RR(f"/?section=integrations&email_oauth_error={error_code}")
         return _RR("/?section=integrations&email_oauth_success=1")
 
     return router
