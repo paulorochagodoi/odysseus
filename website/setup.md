@@ -479,10 +479,12 @@ uv pip sync requirements.lock                          # reproduce it exactly la
 `requirements.lock` is gitignored and platform-specific (compile it on the OS you deploy to). Regenerate it deliberately when you want to take upgrades. The plain `uv pip install -r requirements.txt` keeps following the unpinned requirements like pip does.
 
 ### Outlook / Office 365 email
-Odysseus email accounts currently use IMAP/SMTP username-password auth. Outlook
-and Microsoft 365 generally require OAuth instead, so normal Microsoft mailbox
-passwords will fail. See [the Outlook email guide](email-outlook.md) for the
-current limitation and the planned integration direction.
+Microsoft disabled basic authentication for Outlook and Microsoft 365, so normal
+mailbox passwords fail for IMAP and SMTP. Connect these accounts with OAuth
+instead: register a Microsoft app, set `MICROSOFT_OAUTH_CLIENT_ID` and
+`MICROSOFT_OAUTH_CLIENT_SECRET` in `.env`, then pick the **Outlook / Office 365**
+provider preset and use **Connect with Microsoft**. See
+[the Outlook email guide](email-outlook.md) for the full walkthrough.
 
 ## Security Notes
 Odysseus is a self-hosted workspace with powerful local tools: shell access, file uploads, model downloads, web research, email/calendar integrations, and API tokens. Treat it like an admin console.
@@ -615,14 +617,15 @@ SECURE_COOKIES=true
 OAUTH_REDIRECT_BASE_URL=https://odysseus.example.com
 ```
 
-Gmail OAuth needs nothing here when the proxy runs on the same host: the
+Email OAuth needs nothing here when the proxy runs on the same host: the
 redirect URI is built from the incoming request, and uvicorn rewrites the
 scheme from `X-Forwarded-Proto` for proxies it trusts — by default only
 `127.0.0.1`. A proxy in a separate container or on another machine is not
-trusted, so pin the URI there:
+trusted, so pin the URI for whichever providers you use:
 
 ```bash
 GOOGLE_OAUTH_REDIRECT_URI=https://odysseus.example.com/api/email/oauth/google/callback
+MICROSOFT_OAUTH_REDIRECT_URI=https://odysseus.example.com/api/email/oauth/microsoft/callback
 ```
 
 (uvicorn's own `FORWARDED_ALLOW_IPS` widens that trust, but it has to be in the
