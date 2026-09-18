@@ -2857,7 +2857,7 @@ async function initEmailAccountsSettings() {
     const eafProviderNotes = {
       outlook: {
         title: 'Outlook / Office 365 needs OAuth',
-        body: 'Microsoft disables normal password login for IMAP/SMTP in most Outlook and Microsoft 365 accounts. Use "Connect with Microsoft" above to authorize this mailbox with OAuth instead of entering a password.',
+        body: 'Microsoft disables normal password login for IMAP/SMTP in most Outlook and Microsoft 365 accounts. Use the "Connect with Microsoft" button below to authorize this mailbox with OAuth instead of entering a password.',
       },
     };
     const eafNoteEl = el('eaf-provider-note');
@@ -4386,7 +4386,7 @@ async function initUnifiedIntegrations() {
       },
       outlook: {
         title: 'Outlook / Office 365 needs OAuth',
-        body: 'Microsoft disables normal password login for IMAP/SMTP in most Outlook and Microsoft 365 accounts. Use "Connect with Microsoft" above to authorize this mailbox with OAuth instead of entering a password.',
+        body: 'Microsoft disables normal password login for IMAP/SMTP in most Outlook and Microsoft 365 accounts. Use the "Connect with Microsoft" button below to authorize this mailbox with OAuth instead of entering a password.',
         url: 'https://learn.microsoft.com/exchange/clients-and-mobile-in-exchange-online/disable-basic-authentication-in-exchange-online',
         linkLabel: 'Read Microsoft note',
       },
