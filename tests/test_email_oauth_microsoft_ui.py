@@ -85,4 +85,6 @@ def test_outlook_provider_note_points_at_the_connect_flow(source):
     """The note used to say Microsoft OAuth was unsupported; it must now tell
     the user what to do instead."""
     assert "does not support Microsoft OAuth" not in source
-    assert source.count('Use "Connect with Microsoft" above') == 2
+    # The note renders under the Provider dropdown and the connect panel sits
+    # further down the form, so it must point the reader downwards.
+    assert source.count('the "Connect with Microsoft" button below') == 2
