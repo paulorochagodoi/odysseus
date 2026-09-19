@@ -56,10 +56,12 @@ Add the credentials to your `.env`:
 MICROSOFT_OAUTH_CLIENT_ID=00000000-0000-0000-0000-000000000000
 MICROSOFT_OAUTH_CLIENT_SECRET=your-client-secret-value
 
-# Optional — the tenant sign-in goes through. A tenant GUID or verified
-# domain for single-tenant apps, `organizations` for any work/school
-# account, or `consumers` for personal accounts. Defaults to `common`.
-MICROSOFT_OAUTH_TENANT_ID=common
+# The tenant the sign-in goes through. Defaults to `common`, which only
+# works for a multi-tenant app registration: a single-tenant one (the usual
+# choice inside a company) is refused there with AADSTS50194. Set it to your
+# Directory (tenant) ID — the app registration's Overview page shows it —
+# or to `organizations` for any work/school account.
+MICROSOFT_OAUTH_TENANT_ID=00000000-0000-0000-0000-000000000000
 
 # Set explicitly for HTTPS, reverse-proxy, or hosted deployments. Must match
 # a redirect URI registered on the app above.
@@ -111,6 +113,7 @@ Common codes:
 | `AADSTS7000215` | Wrong client secret. Copy the secret's **Value**, not its Secret ID. |
 | `AADSTS700016` | The app was not found in the tenant — check the client and tenant ids. |
 | `AADSTS50011` | The redirect URI does not match the registered one, exactly. |
+| `AADSTS50194` | The app is single-tenant, so the default `common` endpoint is refused. Set `MICROSOFT_OAUTH_TENANT_ID` to your Directory (tenant) ID. |
 
 **`AUTHENTICATE failed` right after connecting.** The Exchange delegated
 permissions are usually missing, or IMAP/SMTP AUTH is disabled for the mailbox.
