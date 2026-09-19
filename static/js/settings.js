@@ -5662,6 +5662,34 @@ export function close() {
 }
 
 // Handle redirect back from Google OAuth2 — open settings to integrations and show status.
+// What each failure means and what to do about it. Keyed by Odysseus's own
+// error code, then by the provider's code / AADSTS number, which is far more
+// specific when the provider supplied one.
+const OAUTH_ERROR_GUIDANCE = {
+  missing_refresh_token: 'The provider did not return a refresh token, so the mailbox would stop working within the hour. Check that offline_access is granted on the app registration, then connect again.',
+  identity_verification_failed: 'You signed in as a different mailbox than this account is configured for. Sign in with the address in the account\'s Email field, or correct that field first.',
+  token_exchange_failed: 'The provider rejected the token exchange. The client secret is usually wrong or expired, or the redirect URI does not match the one registered on the app.',
+  invalid_state: 'The sign-in could not be matched to the request that started it. Start the connect again from Settings.',
+  missing_code: 'The provider returned no authorization code. Start the connect again from Settings.',
+  account_not_found: 'The email account this connect belonged to no longer exists.',
+  ownership_error: 'That email account belongs to another user.',
+};
+
+const OAUTH_PROVIDER_CODE_GUIDANCE = {
+  access_denied: 'Sign-in or consent was declined. On a work or school tenant this usually means the app still needs administrator approval.',
+  consent_required: 'The tenant requires administrator consent for this app. In Entra, open the app registration, go to API permissions and use "Grant admin consent".',
+  interaction_required: 'Microsoft needs an interactive sign-in for this account. Try again in a normal browser window.',
+  invalid_scope: 'A requested permission is not registered on the app. Add the Exchange delegated permissions (IMAP.AccessAsUser.All, SMTP.Send) and try again.',
+  invalid_client: 'The client id or client secret does not match the registered app.',
+  AADSTS65001: 'Nobody has consented to this app for the tenant yet. In Entra, open the app registration, go to API permissions and use "Grant admin consent".',
+  AADSTS90094: 'This app needs administrator approval before it can be used. Ask a tenant administrator to grant consent.',
+  AADSTS7000215: 'The client secret is wrong. Generate a new one in Certificates & secrets and copy its Value, not its Secret ID.',
+  AADSTS700016: 'The application was not found in this tenant. Check MICROSOFT_OAUTH_CLIENT_ID and MICROSOFT_OAUTH_TENANT_ID.',
+  AADSTS50011: 'The redirect URI does not match the one registered on the app. It must match exactly, including scheme and port.',
+  AADSTS500113: 'The app registration has no redirect URI. Add a Web platform with the callback URL.',
+  AADSTS50020: 'This account cannot sign in to the app. Check the Supported account types on the app registration.',
+};
+
 (function _handleOauthRedirect() {
   const sp = new URLSearchParams(window.location.search);
   if (!sp.has('email_oauth_success') && !sp.has('email_oauth_error')) return;
@@ -5669,25 +5697,101 @@ export function close() {
   const clean = window.location.pathname + window.location.hash;
   window.history.replaceState(null, '', clean);
   const success = sp.has('email_oauth_success');
-  const errMsg = sp.get('email_oauth_error') || '';
+  const reason = sp.get('email_oauth_error') || '';
+  const provider = sp.get('email_oauth_provider') || '';
+  const providerCode = sp.get('email_oauth_code') || '';
+  const aadsts = sp.get('email_oauth_aadsts') || '';
+  const providerName = (OAUTH_PROVIDER_META[provider] || {}).label || 'OAuth';
+
   // Open settings → integrations once the document is ready. This module owns
   // the open() API, so it does not need to wait for a window-level alias.
   function _showResult() {
     open('integrations');
-    // Brief toast-style banner.
-    const banner = document.createElement('div');
-    banner.textContent = success
-      ? 'Google account connected — email is ready'
-      : `Google OAuth failed: ${errMsg || 'unknown error'}`;
-    Object.assign(banner.style, {
+    if (success) {
+      const banner = document.createElement('div');
+      banner.textContent = `${providerName} account connected — email is ready`;
+      Object.assign(banner.style, {
+        position: 'fixed', bottom: '24px', left: '50%', transform: 'translateX(-50%)',
+        background: 'var(--accent, #50fa7b)', color: '#000', padding: '8px 18px',
+        borderRadius: '6px', fontSize: '12px', fontWeight: '600', zIndex: '99999',
+        pointerEvents: 'none', boxShadow: '0 2px 12px rgba(0,0,0,0.3)',
+      });
+      document.body.appendChild(banner);
+      setTimeout(() => banner.remove(), 4000);
+      return;
+    }
+
+    // Failures stay on screen: they carry a code the operator has to read,
+    // act on, and often copy into a support thread. A toast that vanishes
+    // after four seconds sent people digging through browser history for it.
+    const guidance = OAUTH_PROVIDER_CODE_GUIDANCE[aadsts]
+      || OAUTH_PROVIDER_CODE_GUIDANCE[providerCode]
+      || OAUTH_ERROR_GUIDANCE[reason]
+      || 'Check the Odysseus server log for the provider error code.';
+    const codes = [providerCode, aadsts].filter(Boolean).join(' · ');
+
+    const panel = document.createElement('div');
+    Object.assign(panel.style, {
       position: 'fixed', bottom: '24px', left: '50%', transform: 'translateX(-50%)',
-      background: success ? 'var(--accent, #50fa7b)' : 'var(--red, #ff5555)',
-      color: '#000', padding: '8px 18px', borderRadius: '6px', fontSize: '12px',
-      fontWeight: '600', zIndex: '99999', pointerEvents: 'none',
-      boxShadow: '0 2px 12px rgba(0,0,0,0.3)',
+      width: 'min(520px, calc(100vw - 32px))', background: 'var(--card, #1a1a1a)',
+      color: 'var(--fg)', border: '1px solid var(--border)',
+      borderLeft: '3px solid var(--red, #ff5555)', borderRadius: '6px',
+      padding: '12px 14px', fontSize: '12px', lineHeight: '1.5', zIndex: '99999',
+      boxShadow: '0 4px 18px rgba(0,0,0,0.4)',
     });
-    document.body.appendChild(banner);
-    setTimeout(() => banner.remove(), 4000);
+
+    const title = document.createElement('div');
+    title.textContent = `${providerName} connection failed`;
+    Object.assign(title.style, { fontWeight: '600', marginBottom: '4px' });
+
+    const body = document.createElement('div');
+    body.textContent = guidance;
+    Object.assign(body.style, { opacity: '0.85', marginBottom: codes ? '8px' : '4px' });
+
+    panel.appendChild(title);
+    panel.appendChild(body);
+
+    if (codes) {
+      const codeRow = document.createElement('div');
+      codeRow.textContent = codes;
+      Object.assign(codeRow.style, {
+        fontFamily: 'inherit', opacity: '0.7', userSelect: 'all',
+        padding: '4px 6px', border: '1px solid var(--border)', borderRadius: '4px',
+        marginBottom: '8px', wordBreak: 'break-all',
+      });
+      panel.appendChild(codeRow);
+    }
+
+    const actions = document.createElement('div');
+    Object.assign(actions.style, { display: 'flex', gap: '6px', alignItems: 'center' });
+
+    if (codes) {
+      const copy = document.createElement('button');
+      copy.type = 'button';
+      copy.className = 'admin-btn-add';
+      copy.style.fontSize = '11px';
+      copy.textContent = 'Copy code';
+      copy.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(`${reason} ${codes}`.trim());
+          copy.textContent = 'Copied';
+        } catch {
+          copy.textContent = 'Copy failed';
+        }
+      });
+      actions.appendChild(copy);
+    }
+
+    const dismiss = document.createElement('button');
+    dismiss.type = 'button';
+    dismiss.className = 'admin-btn-add';
+    Object.assign(dismiss.style, { fontSize: '11px', opacity: '0.7', marginLeft: 'auto' });
+    dismiss.textContent = 'Dismiss';
+    dismiss.addEventListener('click', () => panel.remove());
+    actions.appendChild(dismiss);
+
+    panel.appendChild(actions);
+    document.body.appendChild(panel);
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', _showResult, { once: true });
