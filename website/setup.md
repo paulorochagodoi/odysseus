@@ -486,6 +486,15 @@ instead: register a Microsoft app, set `MICROSOFT_OAUTH_CLIENT_ID` and
 provider preset and use **Connect with Microsoft**. See
 [the Outlook email guide](email-outlook.md) for the full walkthrough.
 
+### Office 365 calendar
+The same app registration also drives two-way calendar sync over Microsoft
+Graph — Exchange Online does not speak CalDAV, so the CalDAV integration cannot
+reach a Microsoft mailbox. Add the delegated Graph permission
+`Calendars.ReadWrite` and a second redirect URI ending in
+`/api/calendar/oauth/microsoft/callback`, then connect from **Settings →
+Integrations → Microsoft 365 Calendar**. See
+[the Office 365 calendar guide](calendar-office365.md) for the full walkthrough.
+
 ## Security Notes
 Odysseus is a self-hosted workspace with powerful local tools: shell access, file uploads, model downloads, web research, email/calendar integrations, and API tokens. Treat it like an admin console.
 
