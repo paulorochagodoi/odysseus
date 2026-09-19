@@ -5686,7 +5686,7 @@ const OAUTH_PROVIDER_CODE_GUIDANCE = {
   AADSTS7000215: 'The client secret is wrong. Generate a new one in Certificates & secrets and copy its Value, not its Secret ID.',
   AADSTS700016: 'The application was not found in this tenant. Check MICROSOFT_OAUTH_CLIENT_ID and MICROSOFT_OAUTH_TENANT_ID.',
   AADSTS50011: 'The redirect URI does not match the one registered on the app. It must match exactly, including scheme and port.',
-  AADSTS50194: 'The app registration is single-tenant, so the shared /common sign-in endpoint is refused. Set MICROSOFT_OAUTH_TENANT_ID to your Directory (tenant) ID — or to organizations — and restart.',
+  AADSTS50194: 'The app registration is single-tenant, so the shared /common sign-in endpoint is refused. Set MICROSOFT_OAUTH_TENANT_ID to the Directory (tenant) ID from the app registration Overview, then restart. Only a tenant id or verified domain works here — organizations is for multi-tenant apps.',
   AADSTS500113: 'The app registration has no redirect URI. Add a Web platform with the callback URL.',
   AADSTS50020: 'This account cannot sign in to the app. Check the Supported account types on the app registration.',
 };
