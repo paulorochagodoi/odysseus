@@ -1514,6 +1514,79 @@ def _detect_sent_folder(conn):
     return "Sent"
 
 
+# Exchange Online and Gmail file an SMTP-submitted message into the Sent
+# folder on their own. Appending our own copy on top of that is what gives
+# those accounts two identical entries, so we look before we write.
+_AUTO_SENT_COPY_HOSTS = (
+    "smtp.office365.com",
+    "smtp-mail.outlook.com",
+    "smtp.gmail.com",
+    "smtp.office365.us",
+)
+
+
+def _server_saves_sent_copy(cfg: dict) -> bool:
+    """True when the provider files its own copy of outgoing mail in Sent."""
+    provider = str((cfg or {}).get("oauth_provider") or "").strip().lower()
+    if provider in {"google", "microsoft"}:
+        return True
+    host = str((cfg or {}).get("smtp_host") or "").strip().lower()
+    return host in _AUTO_SENT_COPY_HOSTS
+
+
+def _find_message_uid(conn, folder: str, message_id: str) -> str | None:
+    """UID of the message carrying `message_id` in `folder`, or None."""
+    mid = (message_id or "").strip().lstrip("<").rstrip(">")
+    if not mid:
+        return None
+    mid = mid.replace("\\", "\\\\").replace('"', '\\"')
+    try:
+        status, _ = conn.select(_q(folder), readonly=True)
+        if status != "OK":
+            return None
+        status, data = conn.uid("SEARCH", None, f'HEADER Message-ID "{mid}"')
+        if status == "OK" and data and data[0]:
+            return data[0].split()[-1].decode("ascii", errors="ignore")
+    except Exception:
+        return None
+    return None
+
+
+def _ensure_sent_copy(conn, folder: str, message_id: str, raw: bytes,
+                      *, server_saves_copy: bool = False,
+                      wait_seconds: float = 1.0) -> tuple[str | None, bool]:
+    """Guarantee exactly one copy of the just-sent message sits in `folder`.
+
+    Returns `(uid, appended)`. Providers that save their own copy get a short
+    grace period to do it, because that copy usually lands a beat after SMTP
+    returns; only when none appears do we APPEND, so IMAP-only servers still
+    end up with a Sent record and nobody ends up with two.
+
+    The mailbox name is quoted: Exchange Online calls it `Sent Items` and
+    Gmail `[Gmail]/Sent Mail`, and imaplib passes the name through verbatim,
+    so an unquoted APPEND of either is a syntax error the server rejects.
+    """
+    attempts = 3 if server_saves_copy else 1
+    for attempt in range(attempts):
+        uid = _find_message_uid(conn, folder, message_id)
+        if uid:
+            return uid, False
+        if attempt < attempts - 1:
+            time.sleep(wait_seconds)
+
+    status, data = conn.append(_q(folder), "\\Seen", None, raw)
+    if status != "OK":
+        raise RuntimeError(f"APPEND to {folder} failed: {status}")
+    uid = None
+    if data:
+        m = re.search(rb"APPENDUID\s+\d+\s+(\d+)", data[0] or b"")
+        if m:
+            uid = m.group(1).decode("ascii", errors="ignore")
+    if not uid:
+        uid = _find_message_uid(conn, folder, message_id)
+    return uid, True
+
+
 def _detect_drafts_folder(conn):
     """Find the server's Drafts folder name. Gmail usually exposes
     "[Gmail]/Drafts"; other servers often use "Drafts"."""
