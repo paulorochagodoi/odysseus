@@ -88,3 +88,13 @@ def test_outlook_provider_note_points_at_the_connect_flow(source):
     # The note renders under the Provider dropdown and the connect panel sits
     # further down the form, so it must point the reader downwards.
     assert source.count('the "Connect with Microsoft" button below') == 2
+
+
+def test_single_tenant_endpoint_error_is_explained(source):
+    """AADSTS50194 is the failure a single-tenant app registration hits against
+    the default /common endpoint, and the fix is a config change the operator
+    can make — so the panel has to name it rather than say "OAuth failed"."""
+    guidance = source[source.index("const OAUTH_PROVIDER_CODE_GUIDANCE"):]
+    guidance = guidance[:guidance.index("};") + 2]
+    assert "AADSTS50194" in guidance
+    assert "MICROSOFT_OAUTH_TENANT_ID" in guidance

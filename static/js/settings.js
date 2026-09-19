@@ -3384,6 +3384,7 @@ async function initIntegrations() {
 const INTG_TYPES = {
   api:     { label: 'API',     icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>' },
   caldav:  { label: 'CalDAV',  icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>' },
+  msgraph: { label: 'Microsoft 365', icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/><path d="m9 16 2 2 4-4"/></svg>' },
   contacts: { label: 'Contacts', icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>' },
   carddav: { label: 'CardDAV', icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>' },
   email:   { label: 'Email',   icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg>' },
@@ -3483,9 +3484,10 @@ async function initUnifiedIntegrations() {
   }
 
   async function fetchAll() {
-    const [apiRes, calRes, cardRes, contactsRes, emailAccountsRes, mcpRes, vaultRes, tokenRes, calendarsRes] = await Promise.all([
+    const [apiRes, calRes, msGraphRes, cardRes, contactsRes, emailAccountsRes, mcpRes, vaultRes, tokenRes, calendarsRes] = await Promise.all([
       fetch('/api/auth/integrations', { credentials: 'same-origin' }).then(r => r.ok ? r.json() : { integrations: [] }).catch(() => ({ integrations: [] })),
       fetch('/api/calendar/config/accounts', { credentials: 'same-origin' }).then(r => r.ok ? r.json() : { accounts: [] }).catch(() => ({ accounts: [] })),
+      fetch('/api/calendar/config/microsoft', { credentials: 'same-origin' }).then(r => r.ok ? r.json() : { accounts: [] }).catch(() => ({ accounts: [] })),
       fetch('/api/contacts/config', { credentials: 'same-origin' }).then(r => r.ok ? r.json() : {}).catch(() => ({})),
       fetch('/api/contacts/list', { credentials: 'same-origin' }).then(r => r.ok ? r.json() : { contacts: [], count: 0 }).catch(() => ({ contacts: [], count: 0 })),
       fetch('/api/email/accounts', { credentials: 'same-origin' }).then(r => r.ok ? r.json() : { accounts: [] }).catch(() => ({ accounts: [] })),
@@ -3502,6 +3504,17 @@ async function initUnifiedIntegrations() {
     // CalDAV — one card per account
     for (const acc of (calRes.accounts || [])) {
       items.push({ type: 'caldav', id: acc.id, name: acc.label || 'Calendar (CalDAV)', detail: acc.url, enabled: true, data: acc });
+    }
+    // Microsoft 365 calendars — connected by OAuth, so no URL to show.
+    for (const acc of (msGraphRes.accounts || [])) {
+      items.push({
+        type: 'msgraph',
+        id: acc.id,
+        name: acc.label || 'Microsoft 365 Calendar',
+        detail: acc.email || 'Two-way calendar sync',
+        enabled: true,
+        data: acc,
+      });
     }
     // Contacts import first, then the optional CardDAV sync account.
     const contactCount = Number(contactsRes.count || (contactsRes.contacts || []).length || 0);
@@ -3617,6 +3630,7 @@ async function initUnifiedIntegrations() {
         try {
           if (type === 'api') await fetch(`/api/auth/integrations/${id}`, { method: 'DELETE', credentials: 'same-origin' });
           else if (type === 'caldav') await fetch(`/api/calendar/config/accounts/${id}`, { method: 'DELETE', credentials: 'same-origin' });
+          else if (type === 'msgraph') await fetch(`/api/calendar/config/microsoft/${id}`, { method: 'DELETE', credentials: 'same-origin' });
           else if (type === 'contacts') {
             await fetch('/api/contacts/clear', { method: 'DELETE', credentials: 'same-origin' });
           }
@@ -3639,6 +3653,7 @@ async function initUnifiedIntegrations() {
     formEl.style.display = '';
     if (type === 'api') showApiForm(editId);
     else if (type === 'caldav') showCalDavForm(editId);
+    else if (type === 'msgraph') showMsGraphForm();
     else if (type === 'contacts' || type === 'carddav') showCardDavForm();
     else if (type === 'email') showEmailForm(editId);
     else if (type === 'mcp') showMcpForm(editId);
@@ -3847,6 +3862,43 @@ async function initUnifiedIntegrations() {
           el('uf-api-msg').style.color = 'var(--red)';
         }
       } catch (e) { el('uf-api-msg').textContent = 'Error: ' + e.message; el('uf-api-msg').style.color = 'var(--red)'; }
+    });
+  }
+
+  // ── Microsoft 365 calendar (OAuth, no credentials to type) ──
+  async function showMsGraphForm() {
+    let configured = false;
+    try {
+      const r = await fetch('/api/calendar/config/microsoft', { credentials: 'same-origin' });
+      if (r.ok) configured = !!(await r.json()).configured;
+    } catch (_) {}
+
+    const icon = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent, var(--red));flex-shrink:0;"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/><path d="m9 16 2 2 4-4"/></svg>';
+
+    // Without the app registration there is nothing to redirect to, so say
+    // what is missing instead of bouncing the user to a Microsoft error.
+    const notice = configured
+      ? 'Events sync both ways: changes made in Outlook appear in Odysseus, and events you create here are written back to your Microsoft calendar.'
+      : 'MICROSOFT_OAUTH_CLIENT_ID is not set. Add the app registration credentials to your .env and restart Odysseus, then connect.';
+
+    formEl.innerHTML = `
+      <div class="admin-card" style="margin-top:8px">
+        <h2 style="font-size:13px;display:flex;align-items:center;gap:6px;">${icon}Connect Microsoft 365 Calendar</h2>
+        <div class="settings-col">
+          <div style="font-size:11px;opacity:0.8;line-height:1.5;margin-bottom:4px;">${esc(notice)}</div>
+          <div style="font-size:11px;opacity:0.65;line-height:1.5;">Your Microsoft password never reaches Odysseus — sign-in happens on Microsoft and only a revocable token is stored. The app registration needs the delegated Microsoft Graph permission <strong>Calendars.ReadWrite</strong>.</div>
+          <div class="settings-row" style="margin-top:12px;align-items:center;justify-content:flex-end;gap:6px;">
+            <span id="uf-msgraph-msg" style="font-size:11px;flex:1;margin-right:8px"></span>
+            <button class="admin-btn-add" id="uf-msgraph-connect" ${configured ? '' : 'disabled'} style="display:inline-flex;align-items:center;gap:5px;background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));font-weight:600;${configured ? '' : 'opacity:0.45;cursor:not-allowed;'}">Connect with Microsoft</button>
+            <button class="admin-btn-add" id="uf-msgraph-cancel" style="display:inline-flex;align-items:center;gap:5px;background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Cancel</button>
+          </div>
+        </div>
+      </div>`;
+
+    el('uf-msgraph-cancel').addEventListener('click', () => { formEl.style.display = 'none'; });
+    el('uf-msgraph-connect').addEventListener('click', () => {
+      if (!configured) return;
+      window.location.href = '/api/calendar/oauth/microsoft/authorize';
     });
   }
 
@@ -5563,6 +5615,7 @@ async function initUnifiedIntegrations() {
       ['contacts', 'Contacts Import'],
       ['email', 'Email (IMAP/SMTP)'],
       ['mcp', 'MCP Tool Server'],
+      ['msgraph', 'Microsoft 365 Calendar'],
     ];
     const _iconFor = (k) => (INTG_TYPES[k]?.icon || '').replace(/width="14"/, 'width="16"').replace(/height="14"/, 'height="16"');
     const _rowsHtml = _typeOptions.map(([k, label]) => `<button type="button" class="uf-type-option" data-value="${k}" style="display:flex;align-items:center;gap:10px;width:100%;padding:8px 10px;background:transparent;border:0;color:var(--fg);font:inherit;cursor:pointer;text-align:left;"><span style="display:inline-flex;color:var(--accent, var(--red));flex-shrink:0;">${_iconFor(k)}</span><span>${esc(label)}</span></button>`).join('');
@@ -5673,34 +5726,47 @@ const OAUTH_ERROR_GUIDANCE = {
   missing_code: 'The provider returned no authorization code. Start the connect again from Settings.',
   account_not_found: 'The email account this connect belonged to no longer exists.',
   ownership_error: 'That email account belongs to another user.',
+  no_refresh_token: 'Microsoft returned no refresh token, so the calendar would stop syncing within the hour. Check that offline_access is granted on the app registration, then connect again.',
+  microsoft_error: 'Microsoft refused the sign-in before issuing a code.',
 };
 
 const OAUTH_PROVIDER_CODE_GUIDANCE = {
   access_denied: 'Sign-in or consent was declined. On a work or school tenant this usually means the app still needs administrator approval.',
   consent_required: 'The tenant requires administrator consent for this app. In Entra, open the app registration, go to API permissions and use "Grant admin consent".',
   interaction_required: 'Microsoft needs an interactive sign-in for this account. Try again in a normal browser window.',
-  invalid_scope: 'A requested permission is not registered on the app. Add the Exchange delegated permissions (IMAP.AccessAsUser.All, SMTP.Send) and try again.',
+  invalid_scope: 'A requested permission is not registered on the app. Mail needs the Exchange delegated permissions (IMAP.AccessAsUser.All, SMTP.Send); calendar sync needs Microsoft Graph Calendars.ReadWrite.',
   invalid_client: 'The client id or client secret does not match the registered app.',
   AADSTS65001: 'Nobody has consented to this app for the tenant yet. In Entra, open the app registration, go to API permissions and use "Grant admin consent".',
   AADSTS90094: 'This app needs administrator approval before it can be used. Ask a tenant administrator to grant consent.',
   AADSTS7000215: 'The client secret is wrong. Generate a new one in Certificates & secrets and copy its Value, not its Secret ID.',
   AADSTS700016: 'The application was not found in this tenant. Check MICROSOFT_OAUTH_CLIENT_ID and MICROSOFT_OAUTH_TENANT_ID.',
   AADSTS50011: 'The redirect URI does not match the one registered on the app. It must match exactly, including scheme and port.',
+  AADSTS50194: 'The app registration is single-tenant, so the shared /common sign-in endpoint is refused. Set MICROSOFT_OAUTH_TENANT_ID to the Directory (tenant) ID from the app registration Overview, then restart. Only a tenant id or verified domain works here — organizations is for multi-tenant apps.',
   AADSTS500113: 'The app registration has no redirect URI. Add a Web platform with the callback URL.',
   AADSTS50020: 'This account cannot sign in to the app. Check the Supported account types on the app registration.',
 };
 
+// Mail and calendar run the same OAuth dance and report back through the same
+// shaped params under their own prefix, so one handler covers both.
+const OAUTH_REDIRECT_FLOWS = [
+  { prefix: 'email_oauth', subject: 'email' },
+  { prefix: 'calendar_oauth', subject: 'calendar sync' },
+];
+
 (function _handleOauthRedirect() {
   const sp = new URLSearchParams(window.location.search);
-  if (!sp.has('email_oauth_success') && !sp.has('email_oauth_error')) return;
+  const flow = OAUTH_REDIRECT_FLOWS.find(
+    (f) => sp.has(`${f.prefix}_success`) || sp.has(`${f.prefix}_error`),
+  );
+  if (!flow) return;
   // Strip params from URL without a page reload.
   const clean = window.location.pathname + window.location.hash;
   window.history.replaceState(null, '', clean);
-  const success = sp.has('email_oauth_success');
-  const reason = sp.get('email_oauth_error') || '';
-  const provider = sp.get('email_oauth_provider') || '';
-  const providerCode = sp.get('email_oauth_code') || '';
-  const aadsts = sp.get('email_oauth_aadsts') || '';
+  const success = sp.has(`${flow.prefix}_success`);
+  const reason = sp.get(`${flow.prefix}_error`) || '';
+  const provider = sp.get(`${flow.prefix}_provider`) || '';
+  const providerCode = sp.get(`${flow.prefix}_code`) || '';
+  const aadsts = sp.get(`${flow.prefix}_aadsts`) || '';
   const providerName = (OAUTH_PROVIDER_META[provider] || {}).label || 'OAuth';
 
   // Open settings → integrations once the document is ready. This module owns
@@ -5709,7 +5775,7 @@ const OAUTH_PROVIDER_CODE_GUIDANCE = {
     open('integrations');
     if (success) {
       const banner = document.createElement('div');
-      banner.textContent = `${providerName} account connected — email is ready`;
+      banner.textContent = `${providerName} account connected — ${flow.subject} is ready`;
       Object.assign(banner.style, {
         position: 'fixed', bottom: '24px', left: '50%', transform: 'translateX(-50%)',
         background: 'var(--accent, #50fa7b)', color: '#000', padding: '8px 18px',

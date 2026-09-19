@@ -56,6 +56,7 @@ from routes.email_helpers import (
     make_oauth_state, verify_oauth_state,
     EmailNotConfiguredError,
     _imap_connect, _imap, _decode_header, _detect_sent_folder, _detect_drafts_folder,
+    _ensure_sent_copy, _find_message_uid, _server_saves_sent_copy,
     _extract_attachment_text, _list_attachments_from_msg, _has_visible_attachments, _is_likely_signature_image_attachment,
     _extract_attachment_to_disk, _extract_html, _extract_text,
     _fetch_sender_thread_context, _pre_retrieve_context,
@@ -4790,6 +4791,7 @@ def setup_email_routes():
         _source_uid = (req.source_uid or "").strip()
         _source_folder = (req.source_folder or "INBOX").strip() or "INBOX"
         _oauth_provider = cfg.get("oauth_provider") or ""
+        _saves_own_sent_copy = _server_saves_sent_copy(cfg)
         _oauth_access_token = cfg.get("oauth_access_token") or ""
         _oauth_refresh_token = cfg.get("oauth_refresh_token") or ""
         _oauth_token_expiry = cfg.get("oauth_token_expiry") or ""
@@ -4824,22 +4826,13 @@ def setup_email_routes():
                 try:
                     with _imap(_account_id, owner=owner) as imap:
                         sent_folder = _detect_sent_folder(imap)
-                        sent_uid = None
-                        append_st, append_data = imap.append(sent_folder, "\\Seen", None, outer_bytes)
-                        if append_st == "OK" and append_data:
-                            m = re.search(rb"APPENDUID\s+\d+\s+(\d+)", append_data[0] or b"")
-                            if m:
-                                sent_uid = m.group(1).decode("ascii", errors="ignore")
-                        if not sent_uid:
-                            try:
-                                st_sel, _ = imap.select(_q(sent_folder), readonly=True)
-                                if st_sel == "OK":
-                                    mid = (_message_id or "").strip().lstrip("<").rstrip(">").replace('"', '\\"')
-                                    st_uid, uid_data = imap.uid("SEARCH", None, f'HEADER Message-ID "{mid}"')
-                                    if st_uid == "OK" and uid_data and uid_data[0]:
-                                        sent_uid = uid_data[0].split()[-1].decode("ascii", errors="ignore")
-                            except Exception:
-                                pass
+                        sent_uid, _appended = _ensure_sent_copy(
+                            imap,
+                            sent_folder,
+                            _message_id,
+                            outer_bytes,
+                            server_saves_copy=_saves_own_sent_copy,
+                        )
                         # Auto-mark the source email as Answered/done so it
                         # disappears from "undone" filters.
                         if _source_uid:
@@ -4891,7 +4884,14 @@ def setup_email_routes():
                             "message_id": _message_id,
                         }
                 except Exception as e:
-                    logger.warning(f"Failed to append to Sent: {e}")
+                    # Delivery already succeeded, so this is not a send failure
+                    # — but without a Sent copy the message is invisible in
+                    # Odysseus, so say which folder and hand it to the caller.
+                    logger.warning(
+                        "Sent copy could not be filed for %s (folder=%r): %s",
+                        _to_label, locals().get("sent_folder") or "?", e,
+                    )
+                    delivery_result["sent_error"] = str(e)[:200]
                 _cleanup_compose_uploads(_atts)
                 return delivery_result
             except Exception as e:
@@ -4952,7 +4952,7 @@ def setup_email_routes():
             try:
                 with _imap(_draft_acct, owner=owner) as imap:
                     drafts_folder = _detect_drafts_folder(imap)
-                    imap.append(drafts_folder, "\\Draft", None, msg.as_bytes())
+                    imap.append(_q(drafts_folder), "\\Draft", None, msg.as_bytes())
                 return None
             except Exception as e:
                 return str(e)

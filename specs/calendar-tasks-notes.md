@@ -25,7 +25,9 @@ This spec covers calendar, reminders, tasks, assistant runs, and notes in:
 
 `routes/calendar_routes.py` owns `/api/calendar` behavior: config, multi-account CalDAV CRUD, connection test, sync, local calendar CRUD, event CRUD, recurrence expansion, ICS import/export, quick parse, and user timezone offset handling.
 
-`src.caldav_sync` owns CalDAV fetch/sync. `src.caldav_writeback` owns pushing local changes back to remote calendars. Calendar routes request those behaviors; they do not own CalDAV protocol details.
+`src.caldav_sync` owns CalDAV fetch/sync. `src.caldav_writeback` owns pushing local changes back to remote calendars. `src.msgraph_calendar` owns the Microsoft Graph equivalent for Office 365 / Outlook.com, which cannot use CalDAV because Exchange Online does not implement it. Calendar routes request those behaviors; they do not own remote protocol details.
+
+`REMOTE_CALENDAR_SOURCES` names the calendar sources that write back (`caldav`, `msgraph`). Event CRUD marks `caldav_sync_pending` inside the same transaction as the change and calls `_push_remote_event_after_commit` afterwards, dispatching on `CalendarCal.source`; the HTTP routes and the agent tools in `src/tools/calendar.py` share that path. `caldav_sync_pending` is the generic unpushed-edit marker for both backends despite its CalDAV-era name.
 
 Runtime behavior:
 
@@ -41,7 +43,14 @@ Runtime behavior:
   database, and remote-write failure paths;
 - sync direction can be pull, push, or both, and pending local writeback rows are included even before remote href metadata exists;
 - ICS import is per-owner, capped, creates fresh local IDs in the target import calendar, and preserves zero-duration events as visible imported rows rather than dropping them as empty ranges;
-- writeback is best-effort and local SQLite remains source of truth when remote writes fail.
+- writeback is best-effort and local SQLite remains source of truth when remote writes fail;
+- Microsoft Graph sync reuses the same schema: `CalendarCal.source`/`CalendarEvent.origin` carry `msgraph`, `remote_href` holds the Graph event id, `remote_etag` its `changeKey`, and `caldav_base_url` the remote calendar id;
+- Graph pull uses `calendarView` over a bounded window, so a recurring series arrives as concrete occurrences with an empty local `rrule` and the local expander does not re-expand it; a series created locally translates its RRULE into a Graph recurrence pattern, and an untranslatable rule is pushed as a single event rather than as a wrong series;
+- Graph pull prunes only in-window rows it owns (`origin == "msgraph"`, a `remote_href`, no pending marker) and never after a failed fetch, where an empty result means the calendar could not be read rather than that it is empty;
+- `direction=both` pushes before pulling so a local edit is not overwritten by the copy still upstream, and `/api/calendar/sync` merges the CalDAV and Graph results into one payload;
+- Graph calendar ids are UUID5-scoped by owner and account, so two users syncing the same shared calendar do not collide.
+
+Microsoft calendar access is a separate OAuth connection from the mail one: Microsoft issues access tokens per resource and rejects an authorization request mixing Exchange and Graph scopes, so `Calendars.ReadWrite` is consented on its own against the same app registration, with its own callback. Graph tokens are stored encrypted in per-user prefs as `msgraph_accounts`, Microsoft's rotated refresh token is persisted on every refresh, and every Graph call is pinned to `https://graph.microsoft.com` — a server-supplied `@odata.nextLink` pointing elsewhere is refused rather than followed.
 
 Calendar credentials are encrypted at rest and are not returned to clients. CalDAV URL validation rejects unsafe schemes, credentials, fragments, localhost names, bad ports, unsafe IP literals, and hostnames resolving to disallowed addresses, with `ODYSSEUS_ALLOW_PRIVATE_CALDAV=1` as the explicit private-IP escape hatch. CalDAV sync/writeback clients disable redirects so credentials are not followed to another origin. The connection-test client keeps proxy/environment trust disabled but explicitly loads an operator `SSL_CERT_FILE` or `REQUESTS_CA_BUNDLE` when the file exists so private/self-signed deployments use the same CA trust intent as real sync.
 
