@@ -4131,9 +4131,17 @@ def setup_email_routes():
                 sync_meta = dict(payload.get("sync") or {})
                 sync_meta["source"] = "folder_cache_stale"
                 payload["sync"] = sync_meta
+                payload["provisional"] = True
                 return payload
+            # Nothing cached yet. These names are a placeholder to render a
+            # folder picker with, NOT this mailbox's folders: Office 365 calls
+            # its sent folder "Sent Items" and Gmail "[Gmail]/Sent Mail", so
+            # selecting one of these would ask for a mailbox that does not
+            # exist. `provisional` tells the client to come back for the real
+            # list before trusting any name but INBOX.
             return {
                 "folders": ["INBOX", "Sent", "Archive"],
+                "provisional": True,
                 "sync": {"source": "folder_cached_only_fallback"},
             }
 
@@ -4169,9 +4177,11 @@ def setup_email_routes():
                 sync_meta["source"] = "folder_cache_stale"
                 sync_meta["warning"] = "Folder list timed out"
                 payload["sync"] = sync_meta
+                payload["provisional"] = True
                 return payload
             return {
                 "folders": ["INBOX", "Sent", "Archive"],
+                "provisional": True,
                 "error": "Folder list timed out",
                 "sync": {"source": "folder_timeout_fallback"},
             }
@@ -4876,6 +4886,10 @@ def setup_email_routes():
                                         continue
                             except Exception as e:
                                 logger.warning(f"Failed to auto-mark source as answered: {e}")
+                        # The Sent list is cached for a few seconds, so
+                        # without this the message the user just sent is
+                        # missing from the folder they switch to right after.
+                        _invalidate_list_cache(_account_id, sent_folder)
                         delivery_result = {
                             "success": True,
                             "account_id": cfg.get("account_id") or _account_id,

@@ -435,6 +435,8 @@ export async function loadEmails(append = false) {
   }
 }
 
+let _folderRetryDone = false;
+
 async function loadFolders() {
   try {
     const accountQS = _acct().replace(/^&/, '');
@@ -443,6 +445,14 @@ async function loadFolders() {
     const select = document.getElementById('email-folder-select');
     if (!select || !data.folders) return;
     _populateFolderSelect(select, data.folders);
+    // See _loadFolders in emailLibrary.js: a provisional list carries
+    // placeholder names that do not exist on this server. This call already
+    // asks for the live list, so a provisional answer means the fetch fell
+    // back; retry once rather than leaving invented names in the picker.
+    if (data.provisional && !_folderRetryDone) {
+      _folderRetryDone = true;
+      setTimeout(() => { loadFolders().catch(() => {}); }, 2000);
+    }
   } catch (e) {
     console.error('Failed to load folders:', e);
   }
