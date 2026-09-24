@@ -495,6 +495,19 @@ reach a Microsoft mailbox. Add the delegated Graph permission
 Integrations → Microsoft 365 Calendar**. See
 [the Office 365 calendar guide](calendar-office365.md) for the full walkthrough.
 
+### Email signature
+Each email account carries its own outgoing signature, set under **Settings →
+Integrations →** the account **→ Signature**. It is dropped into new messages,
+replies and forwards *before the draft opens*, so you can edit or delete it for
+a single message without touching the setting. In a reply it sits above the
+quoted original, and it is separated by the standard `-- ` line that mail
+clients use to fold a signature away. Markdown works — the same renderer that
+formats the message body formats the signature. Turn **Use signature** off to
+stop adding it without losing the text.
+
+Mail the assistant sends carries the same signature, so a reply it writes for
+you is signed the way your own are.
+
 ## Security Notes
 Odysseus is a self-hosted workspace with powerful local tools: shell access, file uploads, model downloads, web research, email/calendar integrations, and API tokens. Treat it like an admin console.
 
