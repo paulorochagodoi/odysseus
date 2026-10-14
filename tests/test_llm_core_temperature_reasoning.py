@@ -156,3 +156,18 @@ def test_chatgpt_subscription_payload_omits_max_output_tokens_when_zero():
     )
 
     assert "max_output_tokens" not in payload
+
+
+def test_chatgpt_subscription_payload_never_sends_temperature():
+    # The Codex backend returns HTTP 400 "Unsupported parameter: temperature"
+    # for every model, including names outside the reasoning-prefix list.
+    for model in ("gpt-6.1-sol", "gpt-5.1-codex", "gpt-4.1", "custom-model"):
+        payload = llm_core._build_chatgpt_responses_payload(
+            model,
+            [{"role": "user", "content": "Say OK"}],
+            temperature=0.2,
+            max_tokens=37,
+            stream=True,
+        )
+        assert "temperature" not in payload
+    assert "temperature" not in llm_core.CHATGPT_ALLOWED_PAYLOAD_KEYS

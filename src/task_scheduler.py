@@ -1111,7 +1111,10 @@ class TaskScheduler:
                 task.next_run = None
 
             db.commit()
-            logger.info(f"Task '{task.name}' completed (run {run_id})")
+            if run.status == "error":
+                logger.warning("Task '%s' failed (run %s): %s", task.name, run_id, (run.error or "")[:300])
+            else:
+                logger.info(f"Task '{task.name}' completed (run {run_id})")
             output = task.output_target or "session"
             # Per-task notification gate. Default True (notifications_enabled
             # defaults to True at column level), but skip when the user has
@@ -2539,10 +2542,27 @@ class TaskScheduler:
                     db.delete(dupe)
                     removed_dupes.append(action)
 
+            from src.agent_runtime.authority import (
+                restore_task_authority, seal_task_authority, task_operation,
+            )
+            resealed = []
             for task in [t for t in builtin_tasks if t.id in kept_ids]:
                 defs = HOUSEKEEPING_DEFAULTS.get(task.action)
                 if not defs:
                     continue
+                # Built-ins seeded before scheduled tasks carried a sealed
+                # request authority have none, so every run was refused with
+                # "no matching server request authority". A prompt-less row is
+                # indistinguishable from a fresh seed, so seal it like one; a
+                # row carrying a prompt has unknown provenance and stays denied.
+                operation = task_operation(task.task_type, task.action, task.prompt)
+                if not task.prompt and operation is not None and not restore_task_authority(
+                    task.request_authority_json, task.prompt, task.task_type,
+                    task.action, owner=owner,
+                ).permits(operation):
+                    task.request_authority_json = seal_task_authority(
+                        task.prompt, "action", task.action, owner=owner)
+                    resealed.append(task.action)
                 legacy_names = set(defs.get("legacy_names") or [])
                 if (task.name or "") in legacy_names:
                     task.name = defs["name"]
@@ -2627,7 +2647,6 @@ class TaskScheduler:
                 if (task.output_target or "session") == "session":
                     task.output_target = defs.get("output_target", "none")
             seeded = []
-            from src.agent_runtime.authority import seal_task_authority
             for action, defs in HOUSEKEEPING_DEFAULTS.items():
                 if action in existing_actions:
                     continue
@@ -2663,10 +2682,11 @@ class TaskScheduler:
                 )
                 db.add(task)
                 seeded.append(action)
-            if seeded or renamed or removed_dupes or retired_count:
+            if seeded or renamed or removed_dupes or retired_count or resealed:
                 logger.info(
-                    "Housekeeping defaults for %s: seeded=%s renamed=%s deduped=%s retired=%s",
+                    "Housekeeping defaults for %s: seeded=%s renamed=%s deduped=%s retired=%s resealed=%s",
                     owner, seeded, sorted(set(renamed)), sorted(set(removed_dupes)), retired_count,
+                    sorted(resealed),
                 )
             # Always commit — the orphan-run sweep above may have produced
             # pending deletes even when no defaults changed.
