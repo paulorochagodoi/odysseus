@@ -6529,12 +6529,28 @@ def setup_email_routes():
                     sess = _db.query(_CS).filter(_CS.id == session_id, _CS.owner == owner).first()
                     if sess and sess.endpoint_url:
                         url = sess.endpoint_url
+                        # Resolve auth exactly like chat does. Session-backed
+                        # providers (ChatGPT Subscription) never persist their
+                        # bearer, so the stored column is empty or stale and
+                        # must be rebuilt from the endpoint's refreshable
+                        # credentials. Use a detached copy so the ORM row is
+                        # not mutated.
+                        from types import SimpleNamespace
+                        from routes.chat_helpers import resolve_session_auth
+                        _auth_sess = SimpleNamespace(
+                            id=sess.id,
+                            owner=sess.owner,
+                            endpoint_url=sess.endpoint_url,
+                            endpoint_id=getattr(sess, "endpoint_id", None),
+                            headers=sess.headers,
+                        )
+                        resolve_session_auth(_auth_sess, session_id, owner=owner)
                         # Some sessions stored headers double-encoded (a JSON
                         # string inside the JSON column), so the ORM hands back
                         # a str, not a dict — and llm_call_async's h.update()
                         # then throws "dictionary update sequence element…".
                         # Unwrap until we have a dict (or give up → no headers).
-                        _h = sess.headers
+                        _h = _auth_sess.headers
                         for _ in range(3):
                             if isinstance(_h, str):
                                 try:
