@@ -131,6 +131,11 @@ audit context must not manufacture grants.
    Missing/stale snapshots grant no tool authority. Newly seeded server-owned
    housekeeping jobs receive exact snapshots at their static creation point;
    existing rows are not retrospectively authorized by their names/actions.
+   The one exception: `ensure_defaults` reseals a kept built-in housekeeping
+   row (owner-scoped, `task_type="action"`, a `HOUSEKEEPING_DEFAULTS` action)
+   that has no prompt and no permitting snapshot, since it cannot be told
+   apart from a fresh seed. A built-in row that has a prompt keeps unknown
+   provenance and stays denied.
    Internal tool HTTP task payloads cannot become fresh user requests across an
    ASGI context boundary. Built-in actions receive
    an exact admission check. Persist detached-job authority in a separate

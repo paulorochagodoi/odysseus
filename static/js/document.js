@@ -16,6 +16,7 @@ import { langIcon } from './langIcons.js?v=20260831richtexttools91';
 import spinnerModule from './spinner.js';
 import { openLibrary, closeLibrary, isLibraryOpen, initLibrary } from './documentLibrary.js?v=20260911librarybulkdelete1';
 import signatureModule from './signature.js';
+import { splitSignature, composeReplyWithSignature } from './emailLibrary/signature.js';
 import * as Modals from './modalManager.js';
 import { bindMenuDismiss, dismissOrRemove, dismissTopMenu } from './escMenuStack.js';
 import { topPortalZ } from './toolWindowZOrder.js';
@@ -4752,6 +4753,32 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
     return _stripEmailReplyQuoteText(text).body;
   }
 
+  // Whether an AI reply may fill this draft. Only text the user typed counts:
+  // the quoted original and the composer's signature (everything from its
+  // "-- " delimiter down) do not, nor does the drafting placeholder.
+  function _emailAiReplyDraftState(body) {
+    const split = _splitEmailReplyQuote(body);
+    const own = document.createElement('template');
+    own.innerHTML = String(split.body || '');
+    const { authored, signature } = _emailReplySignatureSplit(split.body);
+    const replaceable = (!authored && !own.content.querySelector('img,video,audio,iframe,table'))
+      || /^(\[AI reply draft will appear here\]|Drafting AI reply)/i.test(authored);
+    return { replaceable, authored, signature, quote: split.quote || '' };
+  }
+
+  // The reply's own part (quote already removed), split into what the user
+  // typed and the signature block the composer inserted. HTML bodies keep
+  // their line structure so the "-- " delimiter still sits on its own line.
+  function _emailReplySignatureSplit(body) {
+    const raw = String(body || '');
+    if (!/<[a-z][^>]*>/i.test(raw)) return splitSignature(raw);
+    const tpl = document.createElement('template');
+    tpl.innerHTML = raw
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/(?:p|div|li|h[1-6]|blockquote|pre)>/gi, '$&\n');
+    return splitSignature(tpl.content.textContent || '');
+  }
+
   function _setEmailBodyText(textarea, value) {
     if (!textarea) return;
     textarea.value = value || '';
@@ -6734,12 +6761,8 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
         .replace(/<\/?\|(?:assistant|assistan|user|system|tool)\|>?|<\/\|end\|>?/gi, '')
         .trim();
     };
-    const splitCurrent = _splitEmailReplyQuote(currentBody);
-    const ownBody = document.createElement('template');
-    ownBody.innerHTML = String(splitCurrent.body || '');
-    const ownText = (ownBody.content.textContent || '').trim();
-    const isReplaceableDraft = (!ownText && !ownBody.content.querySelector('img,video,audio,iframe,table')) || /^(\[AI reply draft will appear here\]|Drafting AI reply)/i.test(ownText);
-    if (!isReplaceableDraft) {
+    const draftState = _emailAiReplyDraftState(currentBody);
+    if (!draftState.replaceable) {
       if (uiModule) uiModule.showToast('Reply already has text');
       return;
     }
@@ -6793,7 +6816,7 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
       // Empty-compose path: if there's no original body, send a placeholder
       // so the backend's "no body" guard doesn't fail. The user_hint carries
       // the user's compose intent; the model uses To/Subject + that hint.
-      const bodyForApi = opts.originalBody || splitCurrent.quote || currentBody || (noteHint ? '(no prior email -- compose from the user instructions)' : '');
+      const bodyForApi = opts.originalBody || draftState.quote || draftState.authored || (noteHint ? '(no prior email -- compose from the user instructions)' : '');
       const res = await fetch(`${API_BASE}/api/email/ai-reply`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -6814,8 +6837,7 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
       });
       const data = await readEmailReplyResponse(res, text => {
         if (!draftStillUnchanged()) return false;
-        const quote = splitCurrent.quote || '';
-        _setEmailBodyText(textarea, text + (quote ? `\n\n${quote}` : ''));
+        _setEmailBodyText(textarea, composeReplyWithSignature(text, draftState.signature, draftState.quote));
         generationBody = textarea.value;
         generationRichHtml = richDraftSnapshot();
         return true;
@@ -6835,8 +6857,7 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
         // currentBody. Without this, AI's invented quote stacked on top
         // of the real one and looked like the history had been "edited".
         cleanReply = cleanReply.replace(/\n*On\b[\s\S]*?\bwrote:[\s\S]*$/m, '').trim();
-        const quote = splitCurrent.quote || '';
-        const newBody = cleanReply + (quote ? `\n\n${quote}` : '');
+        const newBody = composeReplyWithSignature(cleanReply, draftState.signature, draftState.quote);
         // Reconcile the final body only while this generation still owns the draft.
         if (!draftStillUnchanged()) {
           if (uiModule) uiModule.showToast('AI reply ready, but draft was edited', { aiReplyResult: true });
@@ -12091,15 +12112,14 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
     const doc = docs.get(docId);
     if (!doc) return;
     const fields = _parseEmailHeader(doc.content || '');
-    const oldSplit = _splitEmailReplyQuote(fields.body || '');
-    const quote = oldSplit.quote;
-    const ownText = _emailReplyOwnText(fields.body || '');
+    const draftState = _emailAiReplyDraftState(fields.body || '');
+    const quote = draftState.quote;
     const initialBody = fields.body || '';
-    if (!force && ownText && !/^(\[AI reply draft will appear here\]|Drafting AI reply)/i.test(ownText)) {
+    if (!force && draftState.authored && !/^(\[AI reply draft will appear here\]|Drafting AI reply)/i.test(draftState.authored)) {
       if (uiModule) uiModule.showToast('AI reply ready, but draft was edited');
       return;
     }
-    const body = String(replyText || '').trim() + (quote ? `\n\n${quote}` : '');
+    const body = composeReplyWithSignature(replyText, draftState.signature, quote);
     if (activeDocId === docId) {
       const textarea = document.getElementById('doc-editor-textarea');
       const rich = _emailRichbodyActive();

@@ -39,3 +39,40 @@ async def test_incomplete_stream_clears_partial_draft(monkeypatch):
     with pytest.raises(ValueError, match='incomplete'):
         await stream_reply([('http://local', 'Ajax', {})], [], emit)
     assert events[-1]['text'] == ''
+
+
+async def _run_with(monkeypatch, chunks):
+    from src import llm_core
+    events = []
+    async def model(*args, **kwargs):
+        for chunk in chunks:
+            yield chunk
+    async def emit(event): events.append(event)
+    monkeypatch.setattr(llm_core, 'stream_llm', model)
+    return await stream_reply([('https://chatgpt.com/backend-api/codex/responses', 'gpt-5.6-luna', {})], [], emit), events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('with_event_line', [True, False])
+async def test_chatgpt_auth_error_surfaces_real_message(monkeypatch, with_event_line):
+    text = 'ChatGPT Subscription credentials expired or were rejected. Reconnect the provider.'
+    chunk = ('event: error\n' if with_event_line else '') + 'data: ' + json.dumps({'status': 401, 'text': text}) + '\n\n'
+    with pytest.raises(ValueError) as info:
+        await _run_with(monkeypatch, [chunk])
+    assert 'credentials expired' in str(info.value)
+    assert 'analysis' not in str(info.value)
+
+
+@pytest.mark.asyncio
+async def test_unreachable_host_error_surfaces_real_message(monkeypatch):
+    chunk = 'event: error\ndata: ' + json.dumps({'error': 'Cannot reach host', 'status': 503}) + '\n\n'
+    with pytest.raises(ValueError, match='Cannot reach host') as info:
+        await _run_with(monkeypatch, [chunk])
+    assert 'analysis' not in str(info.value)
+
+
+@pytest.mark.asyncio
+async def test_analysis_without_markers_still_rejected(monkeypatch):
+    chunk = 'data: ' + json.dumps({'delta': 'The user wants a reply. Context Analysis: be polite.'}) + '\n\n'
+    with pytest.raises(ValueError, match='analysis or an incomplete reply'):
+        await _run_with(monkeypatch, [chunk])
