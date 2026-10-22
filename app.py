@@ -424,51 +424,62 @@ if AUTH_ENABLED:
                 if len(raw_token) < 12 or len(raw_token) > 100:
                     return JSONResponse(status_code=401, content={"error": "Invalid API token"})
                 prefix = raw_token[:8]
+                matched_id = None
+                matched_owner = None
+                matched_scopes = []
+                # Only token *verification* lives in this try: an exception
+                # raised by the route after successful auth must reach normal
+                # error handling (500), not be masked as "Invalid API token".
                 try:
                     if app.state._token_cache_dirty:
                         async with _token_cache_lock:
                             if app.state._token_cache_dirty:
                                 await _asyncio.to_thread(_refresh_token_cache)
                     candidates = list(_token_cache.get(prefix, ()))
-                    matched_id = None
-                    matched_owner = None
-                    matched_scopes = []
                     for tid, thash, owner, scopes in candidates:
                         if _bcrypt.checkpw(raw_token.encode(), thash.encode()):
                             matched_id = tid
                             matched_owner = owner
                             matched_scopes = scopes or []
                             break
-                    if matched_id:
-                        # Update last_used_at off the hot path. Doing it
-                        # inline used to keep the request open across an
-                        # extra commit; do it fire-and-forget instead.
-                        async def _touch_last_used(tid: str):
-                            def _do():
-                                _db = SessionLocal()
-                                try:
-                                    _db.query(ApiToken).filter(ApiToken.id == tid).update(
-                                        {"last_used_at": datetime.utcnow()}
-                                    )
-                                    _db.commit()
-                                finally:
-                                    _db.close()
-                            try:
-                                await _asyncio.to_thread(_do)
-                            except Exception as _e:
-                                logger.debug("Failed to update token last_used_at", exc_info=_e)
-                        _asyncio.create_task(_touch_last_used(matched_id))
-                        # Keep bearer-token callers out of normal cookie/user
-                        request.state.current_user = "api"
-                        request.state.api_token = True
-                        request.state.api_token_id = matched_id
-                        request.state.api_token_owner = matched_owner
-                        request.state.api_token_scopes = matched_scopes
-                        return await call_next(request)
                 except Exception:
+                    matched_id = None
                     logger.warning("API token auth error", exc_info=False)
-                # Invalid bearer token — reject immediately
-                return JSONResponse(status_code=401, content={"error": "Invalid API token"})
+                if not matched_id:
+                    # Invalid bearer token — reject immediately
+                    return JSONResponse(status_code=401, content={"error": "Invalid API token"})
+                # Update last_used_at off the hot path. Doing it
+                # inline used to keep the request open across an
+                # extra commit; do it fire-and-forget instead.
+                async def _touch_last_used(tid: str):
+                    def _do():
+                        _db = SessionLocal()
+                        try:
+                            _db.query(ApiToken).filter(ApiToken.id == tid).update(
+                                {"last_used_at": datetime.utcnow()}
+                            )
+                            _db.commit()
+                        finally:
+                            _db.close()
+                    try:
+                        await _asyncio.to_thread(_do)
+                    except Exception as _e:
+                        logger.debug("Failed to update token last_used_at", exc_info=_e)
+                _asyncio.create_task(_touch_last_used(matched_id))
+                # Keep bearer-token callers out of normal cookie/user
+                request.state.current_user = "api"
+                request.state.api_token = True
+                request.state.api_token_id = matched_id
+                request.state.api_token_owner = matched_owner
+                request.state.api_token_scopes = matched_scopes
+                try:
+                    return await call_next(request)
+                except Exception:
+                    logger.exception(
+                        "Unhandled error in %s %s after API token auth (token id %s)",
+                        request.method, path, matched_id,
+                    )
+                    raise
 
             # --- Cookie-based session auth ---
             token = request.cookies.get(SESSION_COOKIE)
@@ -516,28 +527,69 @@ app.mount("/static", _RevalidatingStatic(directory=STATIC_DIR), name="static")
 @app.get("/api/generated-image/{filename}")
 async def serve_generated_image(filename: str, request: Request):
     """Serve generated images from the data directory."""
-    img_path = resolve_generated_image_path(filename)
-    # SECURITY: filename is the only key, so anyone who knows / guesses a
-    # 12-hex content hash could pull another user's image bytes. Require
-    # auth and verify ownership via the gallery row (when one exists).
-    try:
-        from src.auth_helpers import get_current_user
-        from core.database import SessionLocal as _SL, GalleryImage as _GI
-        _user = get_current_user(request)
-        if _user:
-            _db = _SL()
+    # 1. Validate filename syntax upfront, rejecting malformed requests (400)
+    # without probing the filesystem or database.
+    from src.generated_images import GENERATED_IMAGE_RE
+    if not isinstance(filename, str) or not GENERATED_IMAGE_RE.fullmatch(filename):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    # 2. Ownership verification:
+    # If auth is enabled, verify caller identity and ownership BEFORE probing disk,
+    # preventing existence oracles during outages or unauthorized requests.
+    from src.auth_helpers import auth_disabled, effective_user
+    if not auth_disabled():
+        _user = effective_user(request)
+        if not _user:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+
+        from src.generated_images import get_registered_image_owner
+        _reg_owner = get_registered_image_owner(filename)
+        if _reg_owner is not None:
+            if _reg_owner != _user:
+                raise HTTPException(status_code=404, detail="Image not found")
+        else:
             try:
-                _row = _db.query(_GI).filter(_GI.filename == filename).first()
-                # Generated-but-not-yet-imported images have no row → allow.
-                # Row exists with a different owner → 404 (don't confirm existence).
-                if _row is not None and _row.owner and _row.owner != _user:
-                    raise HTTPException(status_code=404, detail="Image not found")
-            finally:
-                _db.close()
-    except HTTPException:
-        raise
-    except Exception as _e:
-        logger.warning("Image ownership verification failed for %r", filename, exc_info=_e)
+                from core.database import (
+                    SessionLocal as _SL,
+                    GalleryImage as _GI,
+                    Session as _DbSession,
+                    ChatMessage as _CM,
+                )
+                _db = _SL()
+                try:
+                    _row = _db.query(_GI).filter(_GI.filename == filename).first()
+                    if _row is not None:
+                        if _row.owner:
+                            if _row.owner != _user:
+                                raise HTTPException(status_code=404, detail="Image not found")
+                        elif _row.session_id:
+                            _sess = _db.query(_DbSession).filter(_DbSession.id == _row.session_id).first()
+                            if not _sess or not _sess.owner or _sess.owner != _user:
+                                raise HTTPException(status_code=404, detail="Image not found")
+                        else:
+                            # Gallery record has no owner or session link -> fail closed
+                            raise HTTPException(status_code=404, detail="Image not found")
+                    else:
+                        # Rowless image: check if referenced in a chat session owned by this user
+                        _chat_ref = (
+                            _db.query(_CM.id)
+                            .join(_DbSession, _CM.session_id == _DbSession.id)
+                            .filter(_DbSession.owner == _user, _CM.meta_data.like(f"%{filename}%"))
+                            .first()
+                        )
+                        if not _chat_ref:
+                            raise HTTPException(status_code=404, detail="Image not found")
+                finally:
+                    _db.close()
+            except HTTPException:
+                raise
+            except Exception as _e:
+                logger.warning("Image ownership verification failed for %r", filename, exc_info=_e)
+                raise HTTPException(status_code=503, detail="Ownership verification unavailable")
+
+    # 3. Resolve confined path and verify existence on disk
+    img_path = resolve_generated_image_path(filename)
+
     ext = filename.rsplit('.', 1)[-1].lower()
     mime = {
         "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
@@ -545,10 +597,6 @@ async def serve_generated_image(filename: str, request: Request):
         "mp4": "video/mp4", "mov": "video/quicktime", "webm": "video/webm",
         "mkv": "video/x-matroska", "m4v": "video/mp4",
     }.get(ext, "application/octet-stream")
-    # Generated-image filenames are content hashes → the bytes for a given
-    # filename never change. Cache them hard so the gallery doesn't
-    # re-download every full-size image each time it's opened. `immutable`
-    # tells the browser it never needs to revalidate within the max-age.
     return FileResponse(
         str(img_path),
         media_type=mime,
